@@ -1,10 +1,12 @@
 #!/usr/bin/env node
-// Dev.Text — standalone local tool server, independent of any project.
+// SeoEditor (formerly Dev.Text) — standalone local tool server, independent of any project.
 // Attaches to a project via a single <script src="http://localhost:PORT/devtext.js?projectPath=..."> tag.
-// Nothing here lives inside a client project's repo.
+// Nothing here lives inside a client project's repo. This file adds safer projectPath
+// validation, dry-run support, and a git-first workflow that creates a branch + commit
+// when edits are applied.
 
 import http from "node:http";
-import { readFile, readdir, appendFile, mkdir, stat, writeFile } from "node:fs/promises";
+import { readFile, readdir, appendFile, mkdir, stat, writeFile, realpath } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
@@ -126,12 +128,32 @@ async function readBody(req) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-function isSafeProjectPath(p) {
-  return typeof p === "string" && p.startsWith("/") && !p.includes("..");
+// Safer project path validation: must be absolute, have no '..' segments and contain package.json
+async function isSafeProjectPath(p) {
+  try {
+    if (typeof p !== "string") return false;
+    if (!path.isAbsolute(p)) return false;
+    if (p.includes("..")) return false;
+    const real = await realpath(p).catch(() => null);
+    if (!real) return false;
+    const pkg = path.join(real, "package.json");
+    const hasPkg = await stat(pkg).then(() => true).catch(() => false);
+    return hasPkg ? real : false;
+  } catch {
+    return false;
+  }
+}
+
+// Ensure a target file path is contained within the projectPath (prevents escaping)
+function isPathInside(filePath, projectPath) {
+  const rel = path.relative(projectPath, filePath);
+  return !!rel && !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 
 // ---------------------------------------------------------------------
 // Apply text edits directly to source (replaces the old clipboard-only flow)
+// Supports dryRun and git-first commit-on-apply. Returns useful diff/snippets
+// when dryRun is requested.
 // ---------------------------------------------------------------------
 const SOURCE_EXTENSIONS = new Set([".tsx", ".ts", ".jsx", ".js"]);
 const SOURCE_EXCLUDE_DIRS = new Set(["node_modules", ".next", ".git", ".claude", "dev-fonts", "_archive", "logs"]);
@@ -170,6 +192,31 @@ function countOccurrences(haystack, needle) {
   return count;
 }
 
+function excerptAround(content, index, length, context = 80) {
+  const start = Math.max(0, index - context);
+  const end = Math.min(content.length, index + length + context);
+  return content.slice(start, end);
+}
+
+function makeSimpleDiff(original, updated) {
+  // Return a minimal line-based diff for UI preview (not a full unified diff)
+  const oLines = original.split(/\r?\n/);
+  const uLines = updated.split(/\r?\n/);
+  const out = [];
+  const max = Math.max(oLines.length, uLines.length);
+  for (let i = 0; i < max; i++) {
+    const o = oLines[i];
+    const u = uLines[i];
+    if (o === u) {
+      out.push(' ' + (o ?? ''));
+    } else {
+      if (o !== undefined) out.push('-' + o);
+      if (u !== undefined) out.push('+' + u);
+    }
+  }
+  return out.join('\n');
+}
+
 // If the match sits directly inside a quoted string literal ("...", '...', `...`),
 // escape unescaped occurrences of that same quote char (and backslashes) in the
 // replacement so we don't break the source file's syntax.
@@ -184,12 +231,14 @@ function safeReplacement(fileContent, matchIndex, originalText, newText) {
   return newText;
 }
 
-async function applyTextEdit(projectPath, originalText, newText) {
+async function applyTextEdit(projectPath, originalText, newText, options = { dryRun: false, commit: true, commitMessage: null }) {
+  const resolvedProject = await isSafeProjectPath(projectPath);
+  if (!resolvedProject) return { applied: false, reason: "invalid projectPath or missing package.json" };
   const needle = (originalText || "").trim();
   if (!needle) return { applied: false, reason: "empty original text" };
   if (needle === (newText || "").trim()) return { applied: false, reason: "no change" };
 
-  const files = await walkSourceFiles(projectPath);
+  const files = await walkSourceFiles(resolvedProject);
   const matches = [];
   for (const file of files) {
     let content;
@@ -209,30 +258,56 @@ async function applyTextEdit(projectPath, originalText, newText) {
     return {
       applied: false,
       reason: "ambiguous — matched in " + matches.length + " files",
-      matches: matches.map((m) => path.relative(projectPath, m.file)),
+      matches: matches.map((m) => path.relative(resolvedProject, m.file)),
     };
   }
   const single = matches[0];
   if (single.count > 1) {
     return {
       applied: false,
-      reason: "ambiguous — appears " + single.count + " times in " + path.relative(projectPath, single.file),
+      reason: "ambiguous — appears " + single.count + " times in " + path.relative(resolvedProject, single.file),
     };
   }
 
   const matchIndex = single.content.indexOf(needle);
   const replacement = safeReplacement(single.content, matchIndex, needle, (newText || "").trim());
   const updated = single.content.slice(0, matchIndex) + replacement + single.content.slice(matchIndex + needle.length);
+
+  if (options.dryRun) {
+    return {
+      applied: false,
+      dryRun: true,
+      file: path.relative(resolvedProject, single.file),
+      originalExcerpt: excerptAround(single.content, matchIndex, needle.length),
+      updatedExcerpt: excerptAround(updated, matchIndex, replacement.length),
+      diff: makeSimpleDiff(excerptAround(single.content, matchIndex, needle.length).replace(/\r/g, ''), excerptAround(updated, matchIndex, replacement.length).replace(/\r/g, '')),
+    };
+  }
+
+  // safety: ensure target file is inside projectPath
+  if (!isPathInside(single.file, resolvedProject)) {
+    return { applied: false, reason: "target file outside project directory" };
+  }
+
   await writeFile(single.file, updated, "utf8");
-  return { applied: true, file: path.relative(projectPath, single.file) };
+
+  let branch = null;
+  if (options.commit) {
+    try {
+      const gitResult = await createGitBranchAndCommit(resolvedProject, [path.relative(resolvedProject, single.file)], options.commitMessage || `seoeditor: edit text '${needle.slice(0,50)}'`);
+      if (gitResult.ok) branch = gitResult.branch;
+    } catch (e) {
+      // commit failed — we still return applied true but provide a note
+      return { applied: true, file: path.relative(resolvedProject, single.file), commit: false, commitError: String(e).slice(0, 400) };
+    }
+  }
+
+  return { applied: true, file: path.relative(resolvedProject, single.file), branch };
 }
 
 // ---------------------------------------------------------------------
 // Apply style edits directly to source, as a real style={{...}} JSX prop.
-// Only touches a match that is literal JSX text inside the file's own AST —
-// refuses anything found in a plain (non-JSX) string, because that string is
-// very often shared data (lib/*.ts) rendered by many instances, and patching
-// one JSX tag's style there would silently affect every instance that reuses it.
+// Supports dryRun and commit-on-apply as well.
 // ---------------------------------------------------------------------
 const JSX_EXTENSIONS = new Set([".tsx", ".jsx"]);
 
@@ -243,8 +318,6 @@ function parseJsxFile(content) {
   });
 }
 
-// Find the JSXElement whose direct text content (JSXText, or a lone string
-// literal inside a JSXExpressionContainer child) matches `needle` exactly.
 function findJsxTextOwner(ast, needle) {
   let found = null;
   traverse(ast, {
@@ -273,12 +346,14 @@ function buildStylePropertyNodes(cssStyle) {
   });
 }
 
-async function applyStyleEdit(projectPath, originalText, cssStyle) {
+async function applyStyleEdit(projectPath, originalText, cssStyle, options = { dryRun: false, commit: true, commitMessage: null }) {
+  const resolvedProject = await isSafeProjectPath(projectPath);
+  if (!resolvedProject) return { applied: false, reason: "invalid projectPath or missing package.json" };
   const needle = (originalText || "").trim();
   if (!needle) return { applied: false, reason: "empty original text" };
   if (!cssStyle || typeof cssStyle !== "object") return { applied: false, reason: "missing style" };
 
-  const allFiles = await walkSourceFiles(projectPath);
+  const allFiles = await walkSourceFiles(resolvedProject);
   const jsxFiles = allFiles.filter((f) => JSX_EXTENSIONS.has(path.extname(f)));
   const matches = [];
   for (const file of jsxFiles) {
@@ -302,7 +377,7 @@ async function applyStyleEdit(projectPath, originalText, cssStyle) {
   if (single.count > 1) {
     return {
       applied: false,
-      reason: "ambiguous — appears " + single.count + " times in " + path.relative(projectPath, single.file),
+      reason: "ambiguous — appears " + single.count + " times in " + path.relative(resolvedProject, single.file),
     };
   }
 
@@ -348,8 +423,58 @@ async function applyStyleEdit(projectPath, originalText, cssStyle) {
   }
 
   const updated = single.content.slice(0, patchStart) + patchText + single.content.slice(patchEnd);
+
+  if (options.dryRun) {
+    return {
+      applied: false,
+      dryRun: true,
+      file: path.relative(resolvedProject, single.file),
+      originalExcerpt: excerptAround(single.content, patchStart, 0),
+      updatedExcerpt: excerptAround(updated, patchStart, patchText.length),
+      diff: makeSimpleDiff(excerptAround(single.content, patchStart, 0).replace(/\r/g, ''), excerptAround(updated, patchStart, patchText.length).replace(/\r/g, '')),
+    };
+  }
+
+  if (!isPathInside(single.file, resolvedProject)) {
+    return { applied: false, reason: "target file outside project directory" };
+  }
+
   await writeFile(single.file, updated, "utf8");
-  return { applied: true, file: path.relative(projectPath, single.file) };
+
+  let branch = null;
+  if (options.commit) {
+    try {
+      const gitResult = await createGitBranchAndCommit(resolvedProject, [path.relative(resolvedProject, single.file)], options.commitMessage || `seoeditor: style update for '${needle.slice(0,50)}'`);
+      if (gitResult.ok) branch = gitResult.branch;
+    } catch (e) {
+      return { applied: true, file: path.relative(resolvedProject, single.file), commit: false, commitError: String(e).slice(0, 400) };
+    }
+  }
+
+  return { applied: true, file: path.relative(resolvedProject, single.file), branch };
+}
+
+// ---------------------------------------------------------------------
+// Git helpers: create a branch, add files and commit. If not a git repo,
+// return a clear result so the caller can still proceed.
+// ---------------------------------------------------------------------
+async function createGitBranchAndCommit(projectPath, files, message) {
+  try {
+    // ensure we're inside a git repo
+    await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], { cwd: projectPath, timeout: 5000 });
+  } catch (e) {
+    return { ok: false, reason: "not a git repository" };
+  }
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const branchName = `seoeditor/${timestamp}`;
+  try {
+    await execFileAsync("git", ["checkout", "-b", branchName], { cwd: projectPath, timeout: 10000 });
+    await execFileAsync("git", ["add", "--", ...files], { cwd: projectPath, timeout: 10000 });
+    await execFileAsync("git", ["commit", "-m", message], { cwd: projectPath, timeout: 10000 });
+    return { ok: true, branch: branchName };
+  } catch (e) {
+    return { ok: false, reason: String(e.message || e).slice(0, 400) };
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -395,11 +520,12 @@ const server = http.createServer(async (req, res) => {
       const slug = url.searchParams.get("slug") ?? "";
       const file = url.searchParams.get("file");
       const projectPath = url.searchParams.get("projectPath") ?? "";
-      if (!FS_SLUG_RE.test(slug) || !isSafeProjectPath(projectPath)) return sendJSON(res, 400, { error: "invalid params" });
+      const realProject = await isSafeProjectPath(projectPath);
+      if (!FS_SLUG_RE.test(slug) || !realProject) return sendJSON(res, 400, { error: "invalid params" });
 
       if (file) {
         if (!/^[a-zA-Z0-9._-]+\.woff2$/.test(file)) return sendJSON(res, 400, { error: "invalid file" });
-        const filePath = path.join(await fontsourcePkgDir(projectPath, slug), "files", file);
+        const filePath = path.join(await fontsourcePkgDir(realProject, slug), "files", file);
         try {
           const buf = await readFile(filePath);
           return send(res, 200, buf, { "Content-Type": "font/woff2", "Cache-Control": "no-store" });
@@ -407,39 +533,41 @@ const server = http.createServer(async (req, res) => {
           return sendJSON(res, 404, { error: "not found" });
         }
       }
-      const dir = await fontsourcePkgDir(projectPath, slug);
+      const dir = await fontsourcePkgDir(realProject, slug);
       const installed = await stat(dir).then(() => true).catch(() => false);
-      const files = installed ? await listFontsourceFiles(projectPath, slug) : [];
+      const files = installed ? await listFontsourceFiles(realProject, slug) : [];
       return sendJSON(res, 200, { installed, files });
     }
 
     if (url.pathname === "/api/fontsource" && req.method === "POST") {
       const body = JSON.parse((await readBody(req)) || "{}");
       const { slug, projectPath } = body;
-      if (typeof slug !== "string" || !FS_SLUG_RE.test(slug) || !isSafeProjectPath(projectPath)) {
+      const realProject = await isSafeProjectPath(projectPath);
+      if (typeof slug !== "string" || !FS_SLUG_RE.test(slug) || !realProject) {
         return sendJSON(res, 400, { error: "invalid params" });
       }
       try {
         await execFileAsync("npm", ["install", `@fontsource/${slug}`, "--no-audit", "--no-fund"], {
-          cwd: projectPath,
+          cwd: realProject,
           timeout: 90_000,
         });
       } catch (err) {
         return sendJSON(res, 500, { error: "install failed", detail: String(err.message || err).slice(0, 400) });
       }
-      const files = await listFontsourceFiles(projectPath, slug);
+      const files = await listFontsourceFiles(realProject, slug);
       if (files.length === 0) return sendJSON(res, 500, { error: "installed but no font files found" });
       return sendJSON(res, 200, { ok: true, slug, files });
     }
 
     if (url.pathname === "/api/apply-text" && req.method === "POST") {
       const body = JSON.parse((await readBody(req)) || "{}");
-      const { projectPath, originalText, newText } = body;
-      if (!isSafeProjectPath(projectPath) || typeof originalText !== "string" || typeof newText !== "string") {
+      const { projectPath, originalText, newText, dryRun = false, commit = true, commitMessage = null } = body;
+      const realProject = await isSafeProjectPath(projectPath);
+      if (!realProject || typeof originalText !== "string" || typeof newText !== "string") {
         return sendJSON(res, 400, { error: "invalid params" });
       }
       try {
-        const result = await applyTextEdit(projectPath, originalText, newText);
+        const result = await applyTextEdit(realProject, originalText, newText, { dryRun, commit, commitMessage });
         return sendJSON(res, 200, result);
       } catch (err) {
         return sendJSON(res, 500, { applied: false, reason: "write failed", detail: String(err.message || err).slice(0, 400) });
@@ -448,12 +576,13 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname === "/api/apply-style" && req.method === "POST") {
       const body = JSON.parse((await readBody(req)) || "{}");
-      const { projectPath, originalText, cssStyle } = body;
-      if (!isSafeProjectPath(projectPath) || typeof originalText !== "string" || !cssStyle || typeof cssStyle !== "object") {
+      const { projectPath, originalText, cssStyle, dryRun = false, commit = true, commitMessage = null } = body;
+      const realProject = await isSafeProjectPath(projectPath);
+      if (!realProject || typeof originalText !== "string" || !cssStyle || typeof cssStyle !== "object") {
         return sendJSON(res, 400, { error: "invalid params" });
       }
       try {
-        const result = await applyStyleEdit(projectPath, originalText, cssStyle);
+        const result = await applyStyleEdit(realProject, originalText, cssStyle, { dryRun, commit, commitMessage });
         return sendJSON(res, 200, result);
       } catch (err) {
         return sendJSON(res, 500, { applied: false, reason: "write failed", detail: String(err.message || err).slice(0, 400) });
@@ -463,18 +592,20 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/edit-log" && req.method === "POST") {
       const body = JSON.parse((await readBody(req)) || "{}");
       const { projectPath, ...rest } = body;
-      if (!isSafeProjectPath(projectPath)) return sendJSON(res, 400, { error: "invalid projectPath" });
+      const realProject = await isSafeProjectPath(projectPath);
+      if (!realProject) return sendJSON(res, 400, { error: "invalid projectPath" });
       await mkdir(LOGS_DIR, { recursive: true });
-      const logFile = path.join(LOGS_DIR, `${projectSlug(projectPath)}.jsonl`);
-      const entry = { at: new Date().toISOString(), projectPath, ...rest };
+      const logFile = path.join(LOGS_DIR, `${projectSlug(realProject)}.jsonl`);
+      const entry = { at: new Date().toISOString(), projectPath: realProject, ...rest };
       await appendFile(logFile, JSON.stringify(entry) + "\n", "utf8");
       return sendJSON(res, 200, { ok: true });
     }
 
     if (url.pathname === "/api/edit-log" && req.method === "GET") {
       const projectPath = url.searchParams.get("projectPath") ?? "";
-      if (!isSafeProjectPath(projectPath)) return sendJSON(res, 400, { error: "invalid projectPath" });
-      const logFile = path.join(LOGS_DIR, `${projectSlug(projectPath)}.jsonl`);
+      const realProject = await isSafeProjectPath(projectPath);
+      if (!realProject) return sendJSON(res, 400, { error: "invalid projectPath" });
+      const logFile = path.join(LOGS_DIR, `${projectSlug(realProject)}.jsonl`);
       const content = await readFile(logFile, "utf8").catch(() => "");
       return send(res, 200, content, { "Content-Type": "text/plain; charset=utf-8" });
     }
@@ -486,5 +617,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`Dev.Text server listening on http://localhost:${PORT}`);
+  console.log(`SeoEditor server listening on http://localhost:${PORT}`);
 });
